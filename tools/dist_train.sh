@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-CONFIG=$1
+CONFIG="configs\swin\plume.py"
 GPUS=$2
 NNODES=${NNODES:-1}
 NODE_RANK=${NODE_RANK:-0}

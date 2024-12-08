@@ -12,11 +12,12 @@ from .pseudo_sampler import PseudoSampler
 from .random_sampler import RandomSampler
 from .sampling_result import SamplingResult
 from .score_hlr_sampler import ScoreHLRSampler
+from .my_random_sampler import MyRandomSampler
 
 __all__ = [
     'BaseSampler', 'PseudoSampler', 'RandomSampler',
     'InstanceBalancedPosSampler', 'IoUBalancedNegSampler', 'CombinedSampler',
     'OHEMSampler', 'SamplingResult', 'ScoreHLRSampler', 'MaskPseudoSampler',
     'MaskSamplingResult', 'MultiInstanceSamplingResult',
-    'MultiInsRandomSampler'
+    'MultiInsRandomSampler', 'MyRandomSampler'
 ]

@@ -90,6 +90,7 @@ class SamplingResult(util_mixins.NiceRepr):
                  gt_bboxes: Tensor,
                  assign_result: AssignResult,
                  gt_flags: Tensor,
+                 gt_emissions: Tensor = None,
                  avg_factor_with_neg: bool = True) -> None:
         self.pos_inds = pos_inds
         self.neg_inds = neg_inds
@@ -114,6 +115,13 @@ class SamplingResult(util_mixins.NiceRepr):
             if len(gt_bboxes.shape) < 2:
                 gt_bboxes = gt_bboxes.view(-1, box_dim)
             self.pos_gt_bboxes = gt_bboxes[self.pos_assigned_gt_inds.long()]
+
+        # 添加对 gt_emissions 的处理
+        self.gt_emissions = gt_emissions
+        if gt_emissions is not None:
+            self.pos_gt_emissions = gt_emissions[self.pos_assigned_gt_inds.long()]
+        else:
+            self.pos_gt_emissions = None
 
     @property
     def priors(self):
@@ -175,7 +183,9 @@ class SamplingResult(util_mixins.NiceRepr):
             'pos_assigned_gt_inds': self.pos_assigned_gt_inds,
             'num_pos': self.num_pos,
             'num_neg': self.num_neg,
-            'avg_factor': self.avg_factor
+            'avg_factor': self.avg_factor,
+            'pos_gt_bboxes': self.pos_gt_bboxes,
+            'pos_gt_emissions': self.pos_gt_emissions  # 新增
         }
 
     @classmethod

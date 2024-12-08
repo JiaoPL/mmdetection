@@ -19,7 +19,7 @@ from .mask2former_layers import (Mask2FormerTransformerDecoder,
                                  Mask2FormerTransformerDecoderLayer,
                                  Mask2FormerTransformerEncoder)
 from .utils import (MLP, AdaptivePadding, ConditionalAttention, DynamicConv,
-                    PatchEmbed, PatchMerging, coordinate_to_encoding,
+                    PatchEmbed, FourioerEmbedding, PatchMerging, coordinate_to_encoding,
                     inverse_sigmoid, nchw_to_nlc, nlc_to_nchw)
 
 __all__ = [
@@ -37,5 +37,5 @@ __all__ = [
     'CdnQueryGenerator', 'Mask2FormerTransformerEncoder',
     'Mask2FormerTransformerDecoderLayer', 'Mask2FormerTransformerDecoder',
     'GroundingDinoTransformerDecoderLayer', 'GroundingDinoTransformerEncoder',
-    'GroundingDinoTransformerDecoder'
+    'GroundingDinoTransformerDecoder', 'FourioerEmbedding'
 ]

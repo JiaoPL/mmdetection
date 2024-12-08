@@ -309,6 +309,121 @@ class PatchEmbed(BaseModule):
         return x, out_size
 
 
+class FourioerEmbedding(BaseModule):
+    r""" Image to Patch Embedding
+
+    Args:
+        img_size (int): Image size.  Default: 224.
+        patch_size (int): Patch token size. Default: 4.
+        in_chans (int): Number of input image channels. Default: 3.
+        embed_dim (int): Number of linear projection output channels. Default: 96.
+        norm_layer (nn.Module, optional): Normalization layer. Default: None
+    """
+
+    def __init__(self,
+                 in_channels=48,
+                 scalar_channels=2,
+                 embed_dims=96,
+                 conv_type='Conv2d',
+                 kernel_size=16,
+                 stride=16,
+                 padding: Union[int, tuple, str] = 'corner',
+                 dilation: int = 1,
+                 bias: bool = True,
+                 norm_cfg: OptConfigType = None,
+                 input_size: Union[int, tuple] = None,
+                 init_cfg: OptConfigType = None) -> None:
+        super(FourioerEmbedding, self).__init__(init_cfg=init_cfg)
+
+        self.embed_dims = embed_dims
+        if stride is None:
+            stride = kernel_size
+        kernel_size = to_2tuple(kernel_size)
+        stride = to_2tuple(stride)
+        dilation = to_2tuple(dilation)
+
+        if isinstance(padding, str):
+            self.adap_padding = AdaptivePadding(
+                kernel_size=kernel_size,
+                stride=stride,
+                dilation=dilation,
+                padding=padding)
+            # disable the padding of conv
+            padding = 0
+        else:
+            self.adap_padding = None
+        padding = to_2tuple(padding)
+
+        self.proj1 = build_conv_layer(
+            dict(type=conv_type),
+            in_channels=in_channels,
+            out_channels=embed_dims,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            bias=bias)
+
+        self.proj2 = build_conv_layer(
+            dict(type=conv_type),
+            in_channels=scalar_channels,
+            out_channels=embed_dims,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+            bias=bias)
+
+        if norm_cfg is not None:
+            self.norm = build_norm_layer(norm_cfg, embed_dims)[1]
+        else:
+            self.norm = None
+
+        if input_size:
+            input_size = to_2tuple(input_size)
+            # `init_out_size` would be used outside to
+            # calculate the num_patches
+            # when `use_abs_pos_embed` outside
+            self.init_input_size = input_size
+            if self.adap_padding:
+                pad_h, pad_w = self.adap_padding.get_pad_shape(input_size)
+                input_h, input_w = input_size
+                input_h = input_h + pad_h
+                input_w = input_w + pad_w
+                input_size = (input_h, input_w)
+
+            # https://pytorch.org/docs/stable/generated/torch.nn.Conv2d.html
+            h_out = (input_size[0] + 2 * padding[0] - dilation[0] *
+                     (kernel_size[0] - 1) - 1) // stride[0] + 1
+            w_out = (input_size[1] + 2 * padding[1] - dilation[1] *
+                     (kernel_size[1] - 1) - 1) // stride[1] + 1
+            self.init_out_size = (h_out, w_out)
+        else:
+            self.init_input_size = None
+            self.init_out_size = None
+
+
+    def forward(self, x: torch.Tensor, scalars: torch.Tensor) -> Tuple[Tensor, Tuple[int]]:
+        if self.adap_padding:
+            x = self.adap_padding(x)
+
+        x = self.proj1(x)
+        out_h, out_w = (x.shape[2], x.shape[3])
+        x=x.flatten(2).transpose(1, 2)  # B num_patches embed_dim
+
+        scalars = self.proj2(scalars)
+        scalar_h, scalar_w = (scalars.shape[2], scalars.shape[3])
+        scalars = scalars.flatten(2).transpose(1, 2)  # B num_patches embed_dim
+
+        # patch_embeds = torch.cat((scalars, x), dim=1)
+        patch_embeds = scalars + x
+
+        if self.norm is not None:
+            patch_embeds = self.norm(patch_embeds)
+
+        return patch_embeds, (out_h, out_w)
+
+
 class PatchMerging(BaseModule):
     """Merge patch feature map.
 

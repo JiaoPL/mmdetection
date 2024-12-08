@@ -2,14 +2,14 @@
 import random
 from numbers import Number
 from typing import List, Optional, Sequence, Tuple, Union
-
+import math
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from mmengine.dist import barrier, broadcast, get_dist_info
 from mmengine.logging import MessageHub
-from mmengine.model import BaseDataPreprocessor, ImgDataPreprocessor
+from mmengine.model import BaseDataPreprocessor, ImgDataPreprocessor, stack_batch
 from mmengine.structures import PixelData
 from mmengine.utils import is_seq_of
 from torch import Tensor
@@ -89,8 +89,8 @@ class DetDataPreprocessor(ImgDataPreprocessor):
                  non_blocking: Optional[bool] = False,
                  batch_augments: Optional[List[dict]] = None):
         super().__init__(
-            mean=mean,
-            std=std,
+            # mean=mean,
+            # std=std,
             pad_size_divisor=pad_size_divisor,
             pad_value=pad_value,
             bgr_to_rgb=bgr_to_rgb,
@@ -206,6 +206,110 @@ class DetDataPreprocessor(ImgDataPreprocessor):
                     mode='constant',
                     value=self.seg_pad_value)
                 data_samples.gt_sem_seg = PixelData(sem_seg=gt_sem_seg)
+
+
+@MODELS.register_module()
+class PlumeDataPreprocessor(DetDataPreprocessor):
+    def forward(self, data: dict, training: bool = False) -> dict:
+        batch_scalars_pad_shape = self._get_pad_scalars_shape(data)
+        _scalars = self.cast_data(data['scalars'])
+        data = super().forward(data=data, training=training)
+        inputs, data_samples = data['inputs'], data['data_samples']
+
+        if is_seq_of(_scalars, torch.Tensor):
+            scalars = []
+            for _scalar in _scalars:
+                # channel transform
+                if self._channel_conversion:
+                    _scalar = _scalar[[2, 1, 0], ...]
+                # Convert to float after channel conversion to ensure
+                # efficiency
+                _scalar = _scalar.float()
+                # Normalization.
+                if self._enable_normalize:
+                    if self.mean.shape[0] == 3:
+                        assert _scalar.dim(
+                        ) == 3 and _scalar.shape[0] == 3, (
+                            'If the mean has 3 values, the input tensor '
+                            'should in shape of (3, H, W), but got the tensor '
+                            f'with shape {_scalar.shape}')
+                    _scalar = (_scalar - self.mean) / self.std
+                scalars.append(_scalar)
+            # Pad and stack Tensor.
+            scalars = stack_batch(scalars, self.pad_size_divisor,
+                                       self.pad_value)
+        # Process data with `default_collate`.
+        elif isinstance(_scalars, torch.Tensor):
+            assert _scalars.dim() == 4, (
+                'The input of `ImgDataPreprocessor` should be a NCHW tensor '
+                'or a list of tensor, but got a tensor with shape: '
+                f'{_scalars.shape}')
+            if self._channel_conversion:
+                _scalars = _scalars[:, [2, 1, 0], ...]
+            # Convert to float after channel conversion to ensure
+            # efficiency
+            _scalars = _scalars.float()
+            if self._enable_normalize:
+                _scalars = (_scalars - self.mean) / self.std
+            h, w = _scalars.shape[2:]
+            target_h = math.ceil(
+                h / self.pad_size_divisor) * self.pad_size_divisor
+            target_w = math.ceil(
+                w / self.pad_size_divisor) * self.pad_size_divisor
+            pad_h = target_h - h
+            pad_w = target_w - w
+            scalars = F.pad(_scalars, (0, pad_w, 0, pad_h),
+                                 'constant', self.pad_value)
+        else:
+            raise TypeError('Output of `cast_data` should be a dict of '
+                            'list/tuple with inputs and data_samples, '
+                            f'but got {type(data)}: {data}')
+
+        if data_samples is not None:
+            # NOTE the batched image size information may be useful, e.g.
+            # in DETR, this is needed for the construction of masks, which is
+            # then used for the transformer_head.
+            batch_scalar_shape = tuple(scalars[0].size()[-2:])
+            for data_sample, pad_shape in zip(data_samples, batch_scalars_pad_shape):
+                data_sample.set_metainfo({
+                    'batch_scalar_shape': batch_scalar_shape,
+                    'pad_scalar_shape': pad_shape
+                })
+        
+        return {'inputs': inputs, 'scalars': scalars, 'data_samples': data_samples}
+
+
+    def _get_pad_scalars_shape(self, data: dict) -> List[tuple]:
+        _batch_scalars = data['scalars']
+        # Process data with `pseudo_collate`.
+        if is_seq_of(_batch_scalars, torch.Tensor):
+            batch_pad_shape = []
+            for ori_input in _batch_scalars:
+                pad_h = int(
+                    np.ceil(ori_input.shape[1] /
+                            self.pad_size_divisor)) * self.pad_size_divisor
+                pad_w = int(
+                    np.ceil(ori_input.shape[2] /
+                            self.pad_size_divisor)) * self.pad_size_divisor
+                batch_pad_shape.append((pad_h, pad_w))
+        # Process data with `default_collate`.
+        elif isinstance(_batch_scalars, torch.Tensor):
+            assert _batch_scalars.dim() == 4, (
+                'The input of `ImgDataPreprocessor` should be a NCHW tensor '
+                'or a list of tensor, but got a tensor with shape: '
+                f'{_batch_scalars.shape}')
+            pad_h = int(
+                np.ceil(_batch_scalars.shape[2] /
+                        self.pad_size_divisor)) * self.pad_size_divisor
+            pad_w = int(
+                np.ceil(_batch_scalars.shape[3] /
+                        self.pad_size_divisor)) * self.pad_size_divisor
+            batch_pad_shape = [(pad_h, pad_w)] * _batch_scalars.shape[0]
+        else:
+            raise TypeError('Output of `cast_data` should be a dict '
+                            'or a tuple with inputs and data_samples, but got'
+                            f'{type(data)}: {data}')
+        return batch_pad_shape
 
 
 @MODELS.register_module()

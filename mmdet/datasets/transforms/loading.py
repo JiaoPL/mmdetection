@@ -1,5 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Union, Dict, List
+import os
+import h5py
 
 import mmcv
 import numpy as np
@@ -16,6 +18,257 @@ from mmdet.structures.bbox import get_box_type
 from mmdet.structures.bbox.box_type import autocast_box_type
 from mmdet.structures.mask import BitmapMasks, PolygonMasks
 
+
+@TRANSFORMS.register_module()
+class LoadPlumeMat(BaseTransform):
+    def transform(self, results: torch.Dict):
+        plume_path = results['plume_path']
+        wind_path = results['wind_path']
+
+        with h5py.File(plume_path, "r", libver='latest', swmr=True) as plume_data:
+            bands_data = plume_data["L1_with_plume"][:]
+            bands_data = bands_data.astype(np.float32)
+            # bcenter_data = plume_data["bcenter"][:]
+            # bands_data = torch.tensor(bands_data, dtype=torch.float32)
+        with h5py.File(wind_path, "r", libver='latest', swmr=True) as wind_data:
+            wind_u = wind_data["L1_U_field"][:]
+            wind_v = wind_data["L1_V_field"][:]
+            # 将风场数据拼接在一起 (假设风场是U和V两个分量)
+            wind_data_combined = np.stack((wind_u, wind_v), axis=-1, dtype=np.float32)
+
+            # wind_data_combined = torch.tensor(np.array([wind_u, wind_v]), dtype=torch.float32)
+
+        img = bands_data.transpose(1,2,0)
+        results['img'] = img
+        results['wind'] = wind_data_combined
+        # results['bcenter'] = bcenter_data
+        results["img_shape"] = img.shape[:2]
+        results["ori_shape"] = img.shape[:2]
+
+        return results
+
+
+@TRANSFORMS.register_module()
+class LoadPlumeAnnotations(BaseTransform):
+    def __init__(self,
+                 with_bbox: bool = True,
+                 with_label: bool = True,
+                 with_mask: bool = True,
+                 poly2mask: bool = True,
+                 box_type: str = 'hbox',
+                 in_mode: str = 'xywh',
+                 ):
+        self.with_bbox = with_bbox
+        self.with_label = with_label
+        self.box_type = box_type
+        self.with_mask = with_mask
+        self.in_mode = in_mode
+        self.poly2mask = poly2mask
+
+    def _load_bboxes(self, results: dict) -> None:
+        """Private function to load bounding box annotations.
+
+        Args:
+            results (dict): Result dict from :obj:``mmengine.BaseDataset``.
+        Returns:
+            dict: The dict contains loaded bounding box annotations.
+        """
+        gt_bboxes = []
+        gt_ignore_flags = []
+        for instance in results.get('instances', []):
+            gt_bboxes.append(instance['bbox'])
+            gt_ignore_flags.append(instance['ignore_flag'])
+        if self.box_type is None:
+            results['gt_bboxes'] = np.array(
+                gt_bboxes, dtype=np.float32).reshape((-1, 4))
+        else:
+            _, box_type_cls = get_box_type(self.box_type)
+            results['gt_bboxes'] = box_type_cls(gt_bboxes, in_mode=self.in_mode, dtype=torch.float32)
+        results['gt_ignore_flags'] = np.array(gt_ignore_flags, dtype=bool)
+
+    def _load_labels(self, results: dict) -> None:
+        """Private function to load label annotations.
+
+        Args:
+            results (dict): Result dict from :obj:``mmengine.BaseDataset``.
+
+        Returns:
+            dict: The dict contains loaded label annotations.
+        """
+        gt_bboxes_labels = []
+        gt_bboxes_emissions = []
+        for instance in results.get('instances', []):
+            gt_bboxes_labels.append(instance['bbox_label'])
+            gt_bboxes_emissions.append(instance['emission'])
+        # TODO: Inconsistent with mmcv, consider how to deal with it later.
+        results['gt_bboxes_labels'] = np.array(
+            gt_bboxes_labels, dtype=np.int64)
+        results['gt_bboxes_emissions'] = np.array(
+            gt_bboxes_emissions, dtype=np.float32)
+
+    def _poly2mask(self, mask_ann: Union[list, dict], img_h: int,
+                     img_w: int) -> np.ndarray:
+        """Private function to convert masks represented with polygon to
+                bitmaps.
+
+                Args:
+                    mask_ann (list | dict): Polygon mask annotation input.
+                    img_h (int): The height of output mask.
+                    img_w (int): The width of output mask.
+
+                Returns:
+                    np.ndarray: The decode bitmap mask of shape (img_h, img_w).
+                """
+        if isinstance(mask_ann, list):
+            # polygon -- a single object might consist of multiple parts
+            # we merge all parts into one mask rle code
+            mask = self.rle_decode(mask_ann, img_h, img_w)
+        elif isinstance(mask_ann['counts'], list):
+            # uncompressed RLE
+            mask = self.rle_decode(mask_ann['counts'], img_h, img_w)
+        else:
+            # mask
+            mask = mask_ann
+
+        return mask
+
+    def rle_decode(self, rle, img_h, img_w):
+        """Run-length decoding for a 2D numpy array."""
+        flat_matrix = []
+        try:
+            for value, count in rle:
+                flat_matrix.extend([value] * count)
+        except:
+            print(f"rle: {rle}" , flush=True)
+        return np.array(flat_matrix).reshape((img_h, img_w))
+
+    def _process_masks(self, results: dict) -> list:
+        """Process gt_masks and filter invalid polygons.
+
+        Args:
+            results (dict): Result dict from :obj:``mmengine.BaseDataset``.
+
+        Returns:
+            list: Processed gt_masks.
+        """
+        gt_masks = []
+        gt_ignore_flags = []
+        for instance in results.get('instances', []):
+            gt_mask = instance['mask']
+            # If the annotation of segmentation mask is invalid,
+            # ignore the whole instance.
+            if isinstance(gt_mask, list):
+                gt_mask = [
+                    np.array(polygon) for polygon in gt_mask
+                    if len(polygon) % 2 == 0 and len(polygon) >= 6
+                ]
+                if len(gt_mask) == 0:
+                    # ignore this instance and set gt_mask to a fake mask
+                    instance['ignore_flag'] = 1
+                    gt_mask = [np.zeros(6)]
+            elif not self.poly2mask:
+                # `PolygonMasks` requires a ploygon of format List[np.array],
+                # other formats are invalid.
+                instance['ignore_flag'] = 1
+                gt_mask = [np.zeros(6)]
+            elif isinstance(gt_mask, dict) and \
+                    not (gt_mask.get('counts') is not None and
+                         gt_mask.get('size') is not None and
+                         isinstance(gt_mask['counts'], (list, str))):
+                # if gt_mask is a dict, it should include `counts` and `size`,
+                # so that `BitmapMasks` can uncompressed RLE
+                instance['ignore_flag'] = 1
+                gt_mask = [np.zeros(6)]
+            gt_masks.append(gt_mask)
+            # re-process gt_ignore_flags
+            gt_ignore_flags.append(instance['ignore_flag'])
+        results['gt_ignore_flags'] = np.array(gt_ignore_flags, dtype=bool)
+        return gt_masks
+
+    def _load_masks(self, results: dict) -> None:
+        """Private function to load mask annotations.
+
+        Args:
+            results (dict): Result dict from :obj:``mmengine.BaseDataset``.
+        """
+        h, w = results['ori_shape']
+        gt_masks = self._process_masks(results)
+        if self.poly2mask:
+            gt_masks = BitmapMasks(
+                [self._poly2mask(mask, h, w) for mask in gt_masks], h, w)
+        else:
+            # fake polygon masks will be ignored in `PackDetInputs`
+            gt_masks = PolygonMasks([mask for mask in gt_masks], h, w)
+        results['gt_masks'] = gt_masks
+
+    def transform(self,
+                  results: Dict) -> Optional[Union[Dict, Tuple[List, List]]]:
+        if self.with_bbox:
+            self._load_bboxes(results)
+        if self.with_label:
+            self._load_labels(results)
+        if self.with_mask:
+            self._load_masks(results)
+        return results
+
+
+
+@TRANSFORMS.register_module()
+class FourioerTransform(BaseTransform):
+    def __init__(self,
+                 cutoff_frequency: float = 0.5,
+                 use_spectrum: bool = False
+                 ):
+        self.use_spectrum = use_spectrum
+        self.cutoff_frequency = cutoff_frequency
+        self.high_pass_masks = dict()
+
+    def transform(self, results: torch.Dict):
+        img = results['img']  # (H, W, C)
+        shape = results['img_shape']  # (H, W)
+        if shape not in self.high_pass_masks:
+            self.high_pass_masks[shape] = self.high_pass_filter(shape, self.cutoff_frequency)
+        img_fft = np.fft.fft2(img)
+        img_fftshift = np.fft.fftshift(img)
+        # 将高通滤波器应用于频域图像
+        high_pass_mask = self.high_pass_masks[shape]
+        if img.ndim == 3:  # 对每个通道应用滤波器
+            high_pass_mask = high_pass_mask[:, :, None]
+        img_filtered = img_fftshift * high_pass_mask
+
+        if not self.use_spectrum:
+            # 反中心化
+            img_ifftshift = np.fft.ifftshift(img_filtered, axes=(0, 1))
+            # 逆傅里叶变换将频域结果转换回空间域
+            img_ifft_filtered = np.fft.ifft2(img_ifftshift, axes=(0, 1))
+            img_final = img_ifft_filtered.real
+        else:
+            # 计算幅度谱
+            magnitude_spectrum = np.abs(img_filtered)
+            # 计算相位谱
+            phase_spectrum = np.angle(img_filtered)
+            # 先简单sum
+            img_final = img + np.log1p(magnitude_spectrum) + phase_spectrum
+
+        results['img'] = img_final.astype(img.dtype)
+        return results
+
+
+    def high_pass_filter(self, shape, cutoff):
+        """Create a simple high-pass filter.
+
+        Args:
+            shape: Tuple representing the dimensions of the 2D image.
+            cutoff: Cutoff frequency for the high-pass filter.
+
+        Returns:
+            high_pass: High-pass filter mask.
+        """
+        h, w = shape
+        y, x = np.ogrid[-h//2: h//2, -w//2: w//2]
+        high_pass = 1 - np.exp(-((x**2 + y**2) / (2.0 * cutoff**2)))
+        high_pass_mask = (high_pass > cutoff).astype(np.float32)
+        return high_pass_mask
 
 @TRANSFORMS.register_module()
 class LoadImageFromNDArray(LoadImageFromFile):
@@ -459,6 +712,29 @@ class LoadAnnotations(MMCV_LoadAnnotations):
         repr_str += f"imdecode_backend='{self.imdecode_backend}', "
         repr_str += f'backend_args={self.backend_args})'
         return repr_str
+
+
+@TRANSFORMS.register_module()
+class LoadAnnotationsWithEmission(LoadAnnotations):
+    def _load_labels(self, results: dict) -> None:
+        """Private function to load label annotations.
+
+        Args:
+            results (dict): Result dict from :obj:``mmengine.BaseDataset``.
+
+        Returns:
+            dict: The dict contains loaded label annotations.
+        """
+        gt_bboxes_labels = []
+        gt_bboxes_emissions = []
+        for instance in results.get('instances', []):
+            gt_bboxes_labels.append(instance['bbox_label'])
+            gt_bboxes_emissions.append(instance['emission'])
+        # TODO: Inconsistent with mmcv, consider how to deal with it later.
+        results['gt_bboxes_labels'] = np.array(
+            gt_bboxes_labels, dtype=np.int64)
+        results['gt_bboxes_emissions'] = np.array(
+            gt_bboxes_emissions, dtype=np.float32)
 
 
 @TRANSFORMS.register_module()

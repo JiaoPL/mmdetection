@@ -3854,3 +3854,40 @@ class CachedMixUp(BaseTransform):
         repr_str += f'random_pop={self.random_pop}, '
         repr_str += f'prob={self.prob})'
         return repr_str
+
+
+@TRANSFORMS.register_module()
+class LogNormalize(BaseTransform):
+    """LogNormalize the image.
+
+    Required Keys:
+
+    - gt_bboxes_emissions
+
+    Modified Keys:
+
+    - gt_bboxes_emissions
+
+    Args:
+        epsilon (float): A small value to avoid log(0). Defaults to 1e-5.
+    """
+
+    def __init__(self, epsilon: float = 1e-5) -> None:
+        self.epsilon = epsilon
+
+    def transform(self, results: dict) -> dict:
+        """Transform function to log normalize the image.
+
+        Args:
+            results (dict): Result dict.
+
+        Returns:
+            dict: Updated result dict.
+        """
+        results['gt_bboxes_emissions'] = np.log(results['gt_bboxes_emissions'] + self.epsilon)
+        return results
+
+    def __repr__(self):
+        repr_str = self.__class__.__name__
+        repr_str += f'(epsilon={self.epsilon})'
+        return repr_str

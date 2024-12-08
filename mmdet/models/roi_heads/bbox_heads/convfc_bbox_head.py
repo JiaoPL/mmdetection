@@ -1,12 +1,18 @@
 # Copyright (c) OpenMMLab. All rights reserved.
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
+import torch
 import torch.nn as nn
 from mmcv.cnn import ConvModule
 from mmengine.config import ConfigDict
+from mmengine.structures import InstanceData
 from torch import Tensor
 
+from mmdet.models.task_modules.samplers import SamplingResult
+from mmdet.models.utils import multi_apply
+from mmdet.utils import InstanceList
 from mmdet.registry import MODELS
+from mmdet.structures.bbox import get_box_tensor
 from .bbox_head import BBoxHead
 
 
@@ -247,3 +253,270 @@ class Shared4Conv1FCBBoxHead(ConvFCBBoxHead):
             fc_out_channels=fc_out_channels,
             *args,
             **kwargs)
+
+
+@MODELS.register_module()
+class Shared2FCBBoxHeadWithEmission(Shared2FCBBoxHead):
+    def __init__(self,
+                 emission_loss: Optional[Union[dict, ConfigDict]] = None,
+                 normalize_emission: bool = False,
+                 *args,
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+        self.loss_emission = MODELS.build(emission_loss)
+        self.normalize_emission = normalize_emission
+
+        # 添加 emission 回归分支
+        self.emission_fc = nn.Sequential(
+            nn.Linear(self.fc_out_channels, self.fc_out_channels),
+            nn.ReLU(inplace=True),
+            nn.Linear(self.fc_out_channels, 1)  # 预测标量 emission
+        )
+    
+    def forward(self, x: Tuple[Tensor]) -> tuple:
+        # 共享特征提取
+        if self.num_shared_convs > 0:
+            for conv in self.shared_convs:
+                x = conv(x)
+        if self.num_shared_fcs > 0:
+            if self.with_avg_pool:
+                x = self.avg_pool(x)
+            x = x.flatten(1)
+            for fc in self.shared_fcs:
+                x = self.relu(fc(x))
+
+        # 分类和回归分支
+        x_cls, x_reg, x_emission = x, x, x  # 共享特征
+        for conv in self.cls_convs:
+            x_cls = conv(x_cls)
+        if x_cls.dim() > 2:
+            if self.with_avg_pool:
+                x_cls = self.avg_pool(x_cls)
+            x_cls = x_cls.flatten(1)
+        for fc in self.cls_fcs:
+            x_cls = self.relu(fc(x_cls))
+        
+        for conv in self.reg_convs:
+            x_reg = conv(x_reg)
+        if x_reg.dim() > 2:
+            if self.with_avg_pool:
+                x_reg = self.avg_pool(x_reg)
+            x_reg = x_reg.flatten(1)
+        for fc in self.reg_fcs:
+            x_reg = self.relu(fc(x_reg))
+
+        # 排放量回归分支
+        # breakpoint()
+        if x_emission.dim() > 2:
+            if self.with_avg_pool:
+                x_emission = self.avg_pool(x_emission)
+            x_emission = x_emission.flatten(1)
+        emission_pred = self.emission_fc(x_emission).squeeze(-1)
+
+        cls_score = self.fc_cls(x_cls) if self.with_cls else None
+        bbox_pred = self.fc_reg(x_reg) if self.with_reg else None
+        return cls_score, bbox_pred, emission_pred
+
+
+    def _get_targets_single(self, pos_priors: Tensor, neg_priors: Tensor,
+                pos_gt_bboxes: Tensor, pos_gt_labels: Tensor,
+                pos_gt_emissions: Optional[Tensor],
+                cfg: ConfigDict) -> tuple:
+        """计算每张图片的分类、回归和排放目标。
+
+        Args:
+            pos_priors (Tensor): 正样本候选框，形状为 (num_pos, 4)。
+            neg_priors (Tensor): 负样本候选框，形状为 (num_neg, 4)。
+            pos_gt_bboxes (Tensor): 正样本的真实边界框，形状为 (num_pos, 4)。
+            pos_gt_labels (Tensor): 正样本的真实类别标签，形状为 (num_pos,)。
+            pos_gt_emissions (Tensor, optional): 正样本的排放量，形状为 (num_pos,)。
+            cfg (ConfigDict): R-CNN 的训练配置。
+
+        Returns:
+            tuple: 分类、回归和排放的目标值，包括：
+                - labels: 分类标签。
+                - label_weights: 分类权重。
+                - bbox_targets: 边界框回归目标。
+                - bbox_weights: 回归权重。
+                - emission_targets: 排放量目标。
+        """
+        num_pos = pos_priors.size(0)
+        num_neg = neg_priors.size(0)
+        num_samples = num_pos + num_neg
+
+        # original implementation uses new_zeros since BG are set to be 0
+        # now use empty & fill because BG cat_id = num_classes,
+        # FG cat_id = [0, num_classes-1]
+        labels = pos_priors.new_full((num_samples, ),
+                                     self.num_classes,
+                                     dtype=torch.long)
+        reg_dim = pos_gt_bboxes.size(-1) if self.reg_decoded_bbox \
+            else self.bbox_coder.encode_size
+        label_weights = pos_priors.new_zeros(num_samples)
+        emission_weights = pos_priors.new_zeros(num_samples)
+        bbox_targets = pos_priors.new_zeros(num_samples, reg_dim)
+        bbox_weights = pos_priors.new_zeros(num_samples, reg_dim)
+        # 排放目标
+        emission_targets = pos_priors.new_zeros(num_samples)
+        if num_pos > 0:
+            labels[:num_pos] = pos_gt_labels
+            pos_weight = 1.0 if cfg.pos_weight <= 0 else cfg.pos_weight
+            label_weights[:num_pos] = pos_weight
+            if not self.reg_decoded_bbox:
+                pos_bbox_targets = self.bbox_coder.encode(
+                    pos_priors, pos_gt_bboxes)
+            else:
+                # When the regression loss (e.g. `IouLoss`, `GIouLoss`)
+                # is applied directly on the decoded bounding boxes, both
+                # the predicted boxes and regression targets should be with
+                # absolute coordinate format.
+                pos_bbox_targets = get_box_tensor(pos_gt_bboxes)
+            bbox_targets[:num_pos, :] = pos_bbox_targets
+            bbox_weights[:num_pos, :] = 1
+
+            emission_targets[:num_pos] = pos_gt_emissions
+            emission_weights[:num_pos] = pos_weight
+            
+        if num_neg > 0:
+            label_weights[-num_neg:] = 1.0
+
+        num_pos = pos_priors.size(0)
+        num_neg = neg_priors.size(0)
+        num_samples = num_pos + num_neg
+
+        return labels, label_weights, bbox_targets, bbox_weights, emission_targets, emission_weights
+
+
+
+    def get_targets_with_emissions(self,
+            sampling_results: List[SamplingResult],
+            rcnn_train_cfg: ConfigDict,
+            concat: bool = True) -> tuple:
+        """扩展目标生成，包含 emission_targets。"""
+        pos_priors_list = [res.pos_priors for res in sampling_results]
+        neg_priors_list = [res.neg_priors for res in sampling_results]
+        pos_gt_bboxes_list = [res.pos_gt_bboxes for res in sampling_results]
+        pos_gt_labels_list = [res.pos_gt_labels for res in sampling_results]
+        pos_gt_emissions_list = [res.pos_gt_emissions for res in sampling_results]
+        
+        # breakpoint()
+
+        # 调用原始目标生成逻辑
+        labels, label_weights, bbox_targets, bbox_weights, emission_targets, emission_weights = multi_apply(
+            self._get_targets_single,
+            pos_priors_list,
+            neg_priors_list,
+            pos_gt_bboxes_list,
+            pos_gt_labels_list,
+            pos_gt_emissions_list,
+            cfg=rcnn_train_cfg)
+
+        if concat:
+            labels = torch.cat(labels, 0)
+            label_weights = torch.cat(label_weights, 0)
+            bbox_targets = torch.cat(bbox_targets, 0)
+            bbox_weights = torch.cat(bbox_weights, 0)
+            emission_targets = torch.cat(emission_targets, 0)
+            emission_weights = torch.cat(emission_weights, 0)
+
+        # 归一化（如果需要）
+        if self.normalize_emission and concat:
+            emission_targets = (emission_targets - emission_targets.mean()) / (
+                emission_targets.std() + 1e-6)
+
+        return labels, label_weights, bbox_targets, bbox_weights, emission_targets, emission_weights
+
+    
+    def loss_and_target(self,
+        cls_score: Tensor,
+        bbox_pred: Tensor,
+        emission_pred: Tensor,
+        rois: Tensor,
+        sampling_results: List[SamplingResult],
+        rcnn_train_cfg: ConfigDict,
+        concat: bool = True,
+        reduction_override: Optional[str] = None) -> dict:
+        """扩展损失计算，加入 emission 分支。"""
+        cls_reg_targets = self.get_targets_with_emissions(
+            sampling_results, rcnn_train_cfg, concat=concat)
+
+        labels, label_weights, bbox_targets, bbox_weights, emission_targets, emission_weights  = cls_reg_targets
+
+        # 分类和回归损失
+        losses = self.loss(
+            cls_score,
+            bbox_pred,
+            rois,
+            labels,
+            label_weights,
+            bbox_targets,
+            bbox_weights,
+            reduction_override=reduction_override)
+
+        # Emission 损失
+        # breakpoint()
+        if emission_pred is not None:
+            loss_emission = self.loss_emission(emission_pred,emission_targets, emission_weights, reduction_override=reduction_override)
+            # self.loss_emission(emission_pred,emission_targets,reduction_override=reduction_override)
+            losses['loss_emission'] = loss_emission
+
+        return dict(loss_bbox=losses, bbox_targets=cls_reg_targets)
+
+
+    def predict_by_feat(self,
+            rois: Tuple[Tensor],
+            cls_scores: Tuple[Tensor],
+            bbox_preds: Tuple[Tensor],
+            emission_preds: Tuple[Tensor],
+            batch_img_metas: List[dict],
+            rcnn_test_cfg: Optional[ConfigDict] = None,
+            rescale: bool = False) -> InstanceList:
+        """扩展推理，包含 emission 的预测结果。"""
+        assert len(cls_scores) == len(bbox_preds) == len(emission_preds)
+        result_list = []
+        for img_id in range(len(batch_img_metas)):
+            img_meta = batch_img_metas[img_id]
+            results = self._predict_by_feat_single(
+                roi=rois[img_id],
+                cls_score=cls_scores[img_id],
+                bbox_pred=bbox_preds[img_id],
+                emission_pred=emission_preds[img_id],
+                img_meta=img_meta,
+                rescale=rescale,
+                rcnn_test_cfg=rcnn_test_cfg)
+            result_list.append(results)
+        return result_list
+    
+    def _predict_by_feat_single(self,
+            roi: Tensor,
+            cls_score: Tensor,
+            bbox_pred: Tensor,
+            emission_pred: Tensor,
+            img_meta: dict,
+            rescale: bool = False,
+            rcnn_test_cfg: Optional[ConfigDict] = None) -> InstanceData:
+        """将单张图片的特征转换为检测结果，包括 bbox 和 emission。
+
+        Args:
+            roi (Tensor): RoI 的信息，形状为 (num_boxes, 5)。
+            cls_score (Tensor): 分类分数，形状为 (num_boxes, num_classes+1)。
+            bbox_pred (Tensor): 边界框预测结果，形状为 (num_boxes, num_classes*4)。
+            emission_pred (Tensor): 排放量预测结果，形状为 (num_boxes,)。
+            img_meta (dict): 图片元信息。
+            rescale (bool): 是否对检测结果进行缩放。
+            rcnn_test_cfg (ConfigDict): R-CNN 测试配置。
+
+        Returns:
+            InstanceData: 检测结果，包括 bbox、scores、labels 和 emission。
+        """
+        results = super()._predict_by_feat_single(
+            roi, cls_score, bbox_pred, img_meta, rescale, rcnn_test_cfg)
+        # NMS 和结果筛选
+        if rcnn_test_cfg is None:
+            results.emissions = emission_pred  # 直接输出排放预测
+        else:
+            # 关联 emission_pred 到最终检测结果
+            results.emissions = emission_pred[results.labels]
+
+        return results
+
