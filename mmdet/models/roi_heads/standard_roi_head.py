@@ -164,10 +164,13 @@ class StandardRoIHead(BaseRoIHead):
             x[:self.bbox_roi_extractor.num_inputs], rois)
         if self.with_shared_head:
             bbox_feats = self.shared_head(bbox_feats)
-        cls_score, bbox_pred = self.bbox_head(bbox_feats)
+        # cls_score, bbox_pred = self.bbox_head(bbox_feats)
+        cls_score, bbox_pred, emission_pred = self.bbox_head(bbox_feats)
 
+        # bbox_results = dict(
+        #     cls_score=cls_score, bbox_pred=bbox_pred, bbox_feats=bbox_feats)
         bbox_results = dict(
-            cls_score=cls_score, bbox_pred=bbox_pred, bbox_feats=bbox_feats)
+             cls_score=cls_score, bbox_pred=bbox_pred, bbox_feats=bbox_feats, emission_pred=emission_pred)
         return bbox_results
 
     def bbox_loss(self, x: Tuple[Tensor],
@@ -193,6 +196,7 @@ class StandardRoIHead(BaseRoIHead):
         bbox_loss_and_target = self.bbox_head.loss_and_target(
             cls_score=bbox_results['cls_score'],
             bbox_pred=bbox_results['bbox_pred'],
+            emission_pred=bbox_results['emission_pred'],
             rois=rois,
             sampling_results=sampling_results,
             rcnn_train_cfg=self.train_cfg)
@@ -337,9 +341,11 @@ class StandardRoIHead(BaseRoIHead):
         # split batch bbox prediction back to each image
         cls_scores = bbox_results['cls_score']
         bbox_preds = bbox_results['bbox_pred']
+        emission_preds = bbox_results['emission_pred']
         num_proposals_per_img = tuple(len(p) for p in proposals)
         rois = rois.split(num_proposals_per_img, 0)
         cls_scores = cls_scores.split(num_proposals_per_img, 0)
+        emission_preds = emission_preds.split(num_proposals_per_img, 0)
 
         # some detector with_reg is False, bbox_preds will be None
         if bbox_preds is not None:
@@ -357,6 +363,7 @@ class StandardRoIHead(BaseRoIHead):
             rois=rois,
             cls_scores=cls_scores,
             bbox_preds=bbox_preds,
+            emission_preds=emission_preds,
             batch_img_metas=batch_img_metas,
             rcnn_test_cfg=rcnn_test_cfg,
             rescale=rescale)

@@ -54,10 +54,12 @@ class HorizontalBoxes(BaseBoxes):
                  in_mode: Optional[str] = None) -> None:
         super().__init__(data=data, dtype=dtype, device=device, clone=clone)
         if isinstance(in_mode, str):
-            if in_mode not in ('xyxy', 'cxcywh'):
+            if in_mode not in ('xyxy', 'cxcywh', "xywh"):
                 raise ValueError(f'Get invalid mode {in_mode}.')
             if in_mode == 'cxcywh':
                 self.tensor = self.cxcywh_to_xyxy(self.tensor)
+            elif in_mode == 'xywh':
+                self.tensor = self.xywh_to_xyxy(self.tensor)
 
     @staticmethod
     def cxcywh_to_xyxy(boxes: Tensor) -> Tensor:
@@ -84,6 +86,19 @@ class HorizontalBoxes(BaseBoxes):
         """
         xy1, xy2 = boxes.split((2, 2), dim=-1)
         return torch.cat([(xy2 + xy1) / 2, (xy2 - xy1)], dim=-1)
+
+    @staticmethod
+    def xywh_to_xyxy(boxes: Tensor) -> Tensor:
+        """Convert box coordinates from (x, y, w, h) to (x1, y1, x2, y2).
+
+        Args:
+            boxes (Tensor): xywh boxes tensor with shape of (..., 4).
+
+        Returns:
+            Tensor: xyxy boxes tensor with shape of (..., 4).
+        """
+        xy, wh = boxes.split((2, 2), dim=-1)
+        return torch.cat([xy, xy + wh], dim=-1)
 
     @property
     def cxcywh(self) -> Tensor:

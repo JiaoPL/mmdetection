@@ -40,6 +40,8 @@ class AspectRatioBatchSampler(BatchSampler):
     def __iter__(self) -> Sequence[int]:
         for idx in self.sampler:
             data_info = self.sampler.dataset.get_data_info(idx)
+            if "width" not in data_info:
+                continue
             width, height = data_info['width'], data_info['height']
             bucket_id = 0 if width < height else 1
             bucket = self._aspect_ratio_buckets[bucket_id]

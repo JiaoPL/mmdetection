@@ -34,7 +34,7 @@ from .transformer import (MLP, AdaptivePadding, CdnQueryGenerator,
                           DinoTransformerDecoder, DynamicConv,
                           Mask2FormerTransformerDecoder,
                           Mask2FormerTransformerDecoderLayer,
-                          Mask2FormerTransformerEncoder, PatchEmbed,
+                          Mask2FormerTransformerEncoder, PatchEmbed, FourioerEmbedding,
                           PatchMerging, coordinate_to_encoding,
                           inverse_sigmoid, nchw_to_nlc, nlc_to_nchw)
 
@@ -47,7 +47,7 @@ __all__ = [
     'SinePositionalEncoding', 'LearnedPositionalEncoding', 'DynamicConv',
     'SimplifiedBasicBlock', 'NormedLinear', 'NormedConv2d', 'InvertedResidual',
     'SELayer', 'ConvUpsample', 'CSPLayer', 'adaptive_avg_pool2d',
-    'AdaptiveAvgPool2d', 'PatchEmbed', 'nchw_to_nlc', 'nlc_to_nchw', 'DyReLU',
+    'AdaptiveAvgPool2d', 'PatchEmbed', 'FourioerEmbedding', 'nchw_to_nlc', 'nlc_to_nchw', 'DyReLU',
     'ExpMomentumEMA', 'inverse_sigmoid', 'ChannelAttention', 'SiLU', 'MLP',
     'DetrTransformerEncoderLayer', 'DetrTransformerDecoderLayer',
     'DetrTransformerEncoder', 'DetrTransformerDecoder',

@@ -93,7 +93,7 @@ class SmoothL1Loss(nn.Module):
                 override the original reduction method of the loss.
                 Defaults to None.
 
-        Returns:
+        Returns: E:\RS\mmdetection\mmdet\models\losses\smooth_l1_loss.py:99
             Tensor: Calculated loss
         """
         if weight is not None and not torch.any(weight > 0):
